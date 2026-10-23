@@ -1,10 +1,10 @@
 # CampusGPT - RAG chatbot that answers questions from your PDFs
-# Flow: PDF -> text -> chunks -> embeddings -> FAISS -> top-k search -> Gemini answer
+# Flow: PDF -> text (+ tables) -> chunks -> embeddings -> FAISS -> top-k search -> Gemini answer
 
 import os
 import numpy as np
 import faiss
-from pypdf import PdfReader
+import pdfplumber
 import google.generativeai as genai
 from dotenv import load_dotenv
 
@@ -12,23 +12,33 @@ from dotenv import load_dotenv
 load_dotenv()  # reads GOOGLE_API_KEY from the .env file
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-GEN_MODEL_NAME = "gemini-3.8-flash"
+GEN_MODEL_NAME = "gemini-flash-lite-latest"
 EMBED_MODEL_NAME = "models/gemini-embedding-001"
 gen_model = genai.GenerativeModel(GEN_MODEL_NAME)
 
 chat_history = []  # conversation memory
 
 
-# ---------- Module 1: PDF loader ----------
+# ---------- Module 1: PDF loader (text + tables) ----------
 def load_pdf(file_path):
-    reader = PdfReader(file_path)
     source_name = os.path.basename(file_path)
     pages_data = []
 
-    for i, page in enumerate(reader.pages, start=1):
-        text = (page.extract_text() or "").strip()
-        if text:
-            pages_data.append({"source": source_name, "page": i, "text": text})
+    with pdfplumber.open(file_path) as pdf:
+        for i, page in enumerate(pdf.pages, start=1):
+            text = (page.extract_text() or "").strip()
+
+            # add every table on the page as rows: "col1 | col2 | col3"
+            for table in page.extract_tables():
+                rows = [
+                    " | ".join((cell or "").replace("\n", " ") for cell in row)
+                    for row in table
+                ]
+                text += "\n\nTable: " + " ; ".join(rows)
+
+            text = text.strip()
+            if text:
+                pages_data.append({"source": source_name, "page": i, "text": text})
 
     print(f"Loaded '{source_name}' -> {len(pages_data)} pages with text.")
     return pages_data
@@ -131,7 +141,8 @@ def build_prompt(question, retrieved_chunks, chat_history=None):
 
     prompt = f"""You are CampusGPT, an AI learning assistant for students.
 Answer ONLY using the context below, which comes from the student's own
-uploaded documents.
+uploaded documents. Parts of the context marked "Table:" are table rows,
+with columns separated by "|".
 
 If the answer is not present in the context, reply exactly with:
 "I couldn't find that information in the uploaded PDF(s)."
